@@ -1,0 +1,20 @@
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from .config import APP_NAME
+from . import db
+from .routes import videos, channels, niches, collections, tracker, misc
+
+db.init_db()
+app = FastAPI(title=APP_NAME, version="1.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+@app.get("/health")
+def health():
+    return {"ok": True, "app": APP_NAME}
+
+app.include_router(videos.router)
+app.include_router(channels.router)
+app.include_router(niches.router)
+app.include_router(collections.router)
+app.include_router(tracker.router)
+app.include_router(misc.router)
