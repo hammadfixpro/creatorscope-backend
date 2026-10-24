@@ -38,7 +38,15 @@ def profile(channel_id: str, demo: int = None):
             span_days = max((datetime.fromisoformat(dates[-1].replace("Z","+00:00")) - datetime.fromisoformat(dates[0].replace("Z","+00:00"))).days, 1)
             upw = round(len(vids) / (span_days / 7.0), 2)
         except Exception: upw = 0.0
-    return {"id": ch["id"], "title": ch["title"], "url": ch.get("url"),
+    monetization = {
+        "status": "unknown_via_api",
+        "label": "Monetization: YouTube API se maloom nahi hota (sirf channel owner dekh sakta hai)",
+        "explanation": "YouTube Data API v3 does NOT expose other channels' monetization status; it is owner-only analytics. No monetized yes/no is claimed here.",
+        "signals_only": {"subscriber_count": ch.get("subscribers"), "total_views": ch.get("total_views"),
+                         "video_count": ch.get("video_count"), "uploads_per_week": upw,
+                         "avg_views_sample": round(mean(views), 1) if views else 0},
+        "signals_note": "These are public eligibility signals only (e.g. the Partner Programme generally requires 1,000 subscribers), NOT proof of monetization: watch-time / Shorts-view criteria are private and cannot be checked via the API."}
+    return {"id": ch["id"], "title": ch["title"], "monetization": monetization, "url": ch.get("url"),
       "thumbnail_url": ch.get("thumbnail_url"), "banner_url": ch.get("banner_url"),
       "subscriber_count": ch.get("subscribers"), "hidden_subscriber_count": ch.get("hidden_subscriber_count", False),
       "total_views": ch.get("total_views"), "video_count": ch.get("video_count"), "created_at": ch.get("created_at"),
@@ -52,26 +60,85 @@ def profile(channel_id: str, demo: int = None):
                      "growth_history": "locally collected snapshots only", "revenue": "estimate only, not retrieved"},
       "demo": is_demo, "source": "demo" if is_demo else "youtube_api"}
 
+def _similar_item(c, score, matched, avg_views, basis, sample_size, upw):
+    return {"id": c["id"], "title": c["title"], "thumbnail_url": c.get("thumbnail_url"),
+            "url": c.get("url"), "subscriber_count": c.get("subscribers"),
+            "hidden_subscriber_count": c.get("hidden_subscriber_count", False),
+            "total_views": c.get("total_views"), "video_count": c.get("video_count"),
+            "created_at": c.get("created_at"), "avg_views": avg_views,
+            "avg_views_basis": basis, "sample_size": sample_size,
+            "uploads_per_week": upw, "similarity_score": score,
+            "matched_keywords": matched, "topic_categories": c.get("topic_categories", [])}
+
 @router.get("/{channel_id}/similar")
-def similar(channel_id: str, demo: int = None):
+def similar(channel_id: str, demo: int = None, max_results: int = 10):
+    from .. import similarity as sim
+    from ..providers import demo as demo_mod
     ch, vids, is_demo = service.get_channel_with_videos(channel_id, demo_flag=demo)
     if not ch: return {"items": [], "error": "channel not found"}
-    # demo: channels whose videos share keywords; live: search channels by top video title words
+    max_results = min(max(1, max_results), 20)
+    seed_avg = sim.mean_views(vids) or sim.lifetime_avg_views(ch)
     if is_demo:
-        from ..providers import demo as demo_mod
-        kw = set()
-        for v in demo_mod.all_videos():
-            if v["channel_id"] == channel_id: kw |= set(v.get("_keywords","").split())
+        seed_kw = sim.extract_keywords([ch.get("title", "")] + [v["title"] for v in vids] +
+                                       [v.get("_keywords", "") for v in demo_mod.all_videos() if v["channel_id"] == channel_id])
         scored = []
         for c in demo_mod.all_channels():
             if c["id"] == channel_id: continue
-            okw = set()
-            for v in demo_mod.all_videos():
-                if v["channel_id"] == c["id"]: okw |= set(v.get("_keywords","").split())
-            ov = len(kw & okw)
-            if ov: scored.append((ov, c))
-        scored.sort(key=lambda x: -x[0])
-        return {"items": [c for _, c in scored[:10]], "demo": True, "source": "demo"}
-    q = " ".join(vids[0]["title"].split()[:4]) if vids else ch["title"]
-    chans, dm = service.search_channels(q)
-    return {"items": [c for c in chans if c["id"] != channel_id][:10], "demo": dm, "source": "demo" if dm else "youtube_api"}
+            cvids = [v for v in demo_mod.all_videos() if v["channel_id"] == c["id"]]
+            cand_kw = sim.extract_keywords([c["title"]] + [v["title"] for v in cvids] + [v.get("_keywords", "") for v in cvids])
+            score, matched = sim.similarity_score(seed_kw, cand_kw, [], [], ch.get("subscribers"), c.get("subscribers"), seed_avg, sim.mean_views(cvids))
+            if not matched: continue  # size closeness alone is not similarity
+            scored.append(_similar_item(c, score, matched, sim.mean_views(cvids), "recent_sample", len(cvids), sim.uploads_per_week(cvids)))
+        scored.sort(key=lambda x: -x["similarity_score"])
+        return {"seed_channel": {"id": ch["id"], "title": ch["title"]}, "seed_keywords": seed_kw,
+                "items": scored[:max_results], "total": len(scored),
+                "score_formula": "0.45*keyword + 0.15*topic + 0.20*subscriber-log-closeness + 0.20*avg-views-log-closeness (see app/similarity.py)",
+                "demo": True, "source": "demo"}
+    # Live: keyword groups -> at most 3 channel searches (100 units each).
+    from ..providers.youtube import YouTubeProvider
+    seed_kw = sim.extract_keywords([ch.get("title", ""), ch.get("description", "")] + [v["title"] for v in vids])
+    seed_topics = ch.get("topic_categories", [])
+    try:
+        yt = YouTubeProvider()
+        queries = [" ".join(seed_kw[i:i + 3]) for i in range(0, min(len(seed_kw), 9), 3)][:3]
+        if not queries: queries = [ch["title"]]
+        cand_ids = []
+        for q in queries:
+            for cid in yt.search_channel_ids(q, max_results=25):
+                if cid != channel_id and cid not in cand_ids: cand_ids.append(cid)
+        cands = yt.get_channels(cand_ids) if cand_ids else []
+        prelim = []
+        for c in cands:
+            score, matched = sim.similarity_score(seed_kw, sim.extract_keywords([c["title"], c.get("description", "")]),
+                                                  seed_topics, c.get("topic_categories", []),
+                                                  ch.get("subscribers"), c.get("subscribers"), seed_avg, sim.lifetime_avg_views(c))
+            if not matched and not (set(seed_topics) & set(c.get("topic_categories", []))):
+                continue  # size closeness alone is not similarity
+            prelim.append((score, matched, c))
+        prelim.sort(key=lambda x: -x[0])
+        # Affordable recent sample: only the top candidates get a recent-video
+        # fetch (3 units each); the rest keep their lifetime average, labelled.
+        items, quota = [], len(queries) * 100 + 1
+        for score, matched, c in prelim[:max_results]:
+            avg, basis, sample, upw = sim.lifetime_avg_views(c), "lifetime", 0, 0.0
+            try:
+                recent = yt.channel_recent_videos(c["id"], max_results=10)
+                if recent:
+                    avg, basis, sample, upw = sim.mean_views(recent), "recent_sample", len(recent), sim.uploads_per_week(recent)
+                    quota += 3
+            except Exception:
+                pass
+            # Re-score with the recent-sample average; keywords/topics unchanged.
+            score2, _ = sim.similarity_score(seed_kw, sim.extract_keywords([c["title"], c.get("description", "")]),
+                                             seed_topics, c.get("topic_categories", []),
+                                             ch.get("subscribers"), c.get("subscribers"), seed_avg, avg)
+            items.append(_similar_item(c, score2, matched, avg, basis, sample, upw))
+        items.sort(key=lambda x: -x["similarity_score"])
+        return {"seed_channel": {"id": ch["id"], "title": ch["title"]}, "seed_keywords": seed_kw,
+                "items": items, "total": len(items),
+                "score_formula": "0.45*keyword + 0.15*topic + 0.20*subscriber-log-closeness + 0.20*avg-views-log-closeness (see app/similarity.py)",
+                "quota_cost_units_estimate": quota, "quota_note": "Uncached worst case ~334 units; provider cache (3600s) makes repeats cost 0 fresh units.",
+                "demo": False, "source": "youtube_api"}
+    except Exception as e:
+        return {"seed_channel": {"id": ch["id"], "title": ch["title"]}, "seed_keywords": seed_kw,
+                "items": [], "error": f"similar channels unavailable: {e}", "demo": False, "source": "youtube_api"}
