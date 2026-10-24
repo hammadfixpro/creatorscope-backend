@@ -21,10 +21,11 @@ class YouTubeProvider:
     @property
     def configured(self): return bool(self.key)
 
-    def _get(self, endpoint, params, quota_key):
+    def _get(self, endpoint, params, quota_key, use_cache=True):
         cache_key = hashlib.sha256((endpoint + json.dumps(params, sort_keys=True)).encode()).hexdigest()
-        cached = db.cache_get(cache_key)
-        if cached is not None: return cached
+        if use_cache:
+            cached = db.cache_get(cache_key)
+            if cached is not None: return cached
         params = {**params, "key": self.key}
         with httpx.Client(timeout=20) as client:
             r = client.get(f"{BASE}/{endpoint}", params=params)
@@ -51,39 +52,54 @@ class YouTubeProvider:
         data = self._get("search", {"part": "snippet", "type": "channel", "q": q or "", "maxResults": min(max_results, 50)}, "search")
         return [it["id"]["channelId"] for it in data.get("items", []) if it.get("id", {}).get("channelId")]
 
+    def _parse_video(self, it):
+        sn, st, cd = it.get("snippet", {}), it.get("statistics", {}), it.get("contentDetails", {})
+        dur = _dur_to_seconds(cd.get("duration", ""))
+        return {"id": it["id"], "title": sn.get("title", ""), "channel_id": sn.get("channelId", ""),
+            "channel_title": sn.get("channelTitle", ""), "thumbnail_url": (sn.get("thumbnails", {}).get("high", {}) or sn.get("thumbnails", {}).get("default", {})).get("url", ""),
+            "published_at": sn.get("publishedAt", ""), "views": int(st.get("viewCount", 0)),
+            "likes": int(st.get("likeCount", 0)), "comments": int(st.get("commentCount", 0)),
+            "duration_seconds": dur, "is_short": dur <= 60,
+            "url": f"https://www.youtube.com/watch?v={it['id']}", "channel_subscribers": None,
+            "_keywords": (sn.get("title", "") + " " + " ".join(sn.get("tags", [])[:10])).lower()}
+
     def get_videos(self, ids):
         out = []
         for i in range(0, len(ids), 50):
             batch = ids[i:i+50]
             if not batch: continue
             data = self._get("videos", {"part": "snippet,statistics,contentDetails", "id": ",".join(batch)}, "videos")
-            for it in data.get("items", []):
-                sn, st, cd = it.get("snippet", {}), it.get("statistics", {}), it.get("contentDetails", {})
-                dur = _dur_to_seconds(cd.get("duration", ""))
-                out.append({"id": it["id"], "title": sn.get("title", ""), "channel_id": sn.get("channelId", ""),
-                    "channel_title": sn.get("channelTitle", ""), "thumbnail_url": (sn.get("thumbnails", {}).get("high", {}) or sn.get("thumbnails", {}).get("default", {})).get("url", ""),
-                    "published_at": sn.get("publishedAt", ""), "views": int(st.get("viewCount", 0)),
-                    "likes": int(st.get("likeCount", 0)), "comments": int(st.get("commentCount", 0)),
-                    "duration_seconds": dur, "is_short": dur <= 60,
-                    "url": f"https://www.youtube.com/watch?v={it['id']}", "channel_subscribers": None,
-                    "_keywords": (sn.get("title", "") + " " + " ".join(sn.get("tags", [])[:10])).lower()})
+            out.extend(self._parse_video(it) for it in data.get("items", []))
         return out
+
+    def trending_videos(self, region=None, category_id=None, max_results=25, refresh=False):
+        """videos.list chart=mostPopular — 1 quota unit. refresh=True bypasses
+        the 3600s cache for the trending call itself (channel-subscriber
+        enrichment still uses its own cache; subs change slowly)."""
+        params = {"part": "snippet,statistics,contentDetails", "chart": "mostPopular",
+                  "maxResults": min(max(1, max_results), 50)}
+        if region: params["regionCode"] = region
+        if category_id: params["videoCategoryId"] = category_id
+        data = self._get("videos", params, "videos", use_cache=not refresh)
+        return [self._parse_video(it) for it in data.get("items", [])]
 
     def get_channels(self, ids):
         out = []
         for i in range(0, len(ids), 50):
             batch = ids[i:i+50]
             if not batch: continue
-            data = self._get("channels", {"part": "snippet,statistics,brandingSettings", "id": ",".join(batch)}, "channels")
+            data = self._get("channels", {"part": "snippet,statistics,brandingSettings,topicDetails", "id": ",".join(batch)}, "channels")
             for it in data.get("items", []):
                 sn, st = it.get("snippet", {}), it.get("statistics", {})
                 hidden = bool(st.get("hiddenSubscriberCount"))
+                topics = [u.rsplit("/", 1)[-1].replace("_", " ") for u in (it.get("topicDetails", {}) or {}).get("topicCategories", [])]
                 out.append({"id": it["id"], "title": sn.get("title", ""), "subscribers": None if hidden else int(st.get("subscriberCount", 0)),
                     "hidden_subscriber_count": hidden, "total_views": int(st.get("viewCount", 0)),
                     "video_count": int(st.get("videoCount", 0)), "created_at": sn.get("publishedAt", ""),
                     "thumbnail_url": (sn.get("thumbnails", {}).get("high", {}) or {}).get("url", ""),
                     "banner_url": ((it.get("brandingSettings", {}).get("image", {}) or {}).get("bannerExternalUrl")),
-                    "url": f"https://www.youtube.com/channel/{it['id']}", "description": sn.get("description", "")[:500]})
+                    "url": f"https://www.youtube.com/channel/{it['id']}", "description": sn.get("description", "")[:500],
+                    "topic_categories": topics})
         return out
 
     def channel_recent_videos(self, channel_id, max_results=15):
