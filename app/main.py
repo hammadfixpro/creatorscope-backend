@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from .config import APP_NAME
 from . import db
-from .routes import videos, channels, niches, collections, tracker, misc
+from .routes import videos, channels, niches, collections, tracker, misc, trending
 
 db.init_db()
 app = FastAPI(title=APP_NAME, version="1.0.0")
@@ -18,3 +18,4 @@ app.include_router(niches.router)
 app.include_router(collections.router)
 app.include_router(tracker.router)
 app.include_router(misc.router)
+app.include_router(trending.router)
